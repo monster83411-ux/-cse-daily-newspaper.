@@ -1,4 +1,5 @@
 name: CSE Daily Newspaper
+
 on:
   schedule:
     # Starts 07:27 IST (not :00, because GitHub is busiest at the start of each hour).
@@ -12,20 +13,30 @@ on:
         type: choice
         options: [live, demo, test-llm]
         default: live
+
 permissions:
   contents: write
+
+# Never run two newspapers at the same time (they would fight over seen.json).
+concurrency:
+  group: newspaper
+  cancel-in-progress: false
+
 jobs:
   build-and-send:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: '3.12'
           cache: pip
+
       - name: Install libraries
         run: pip install -r requirements.txt
+
       - name: Run the newspaper robot
         id: robot
         env:
@@ -40,6 +51,7 @@ jobs:
           OPENROUTER_MODELS: ${{ vars.OPENROUTER_MODELS }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: python main.py --mode "$MODE"
+
       - name: Keep a copy of the PDF
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -48,15 +60,31 @@ jobs:
           path: output/*.pdf
           retention-days: 14
           if-no-files-found: ignore
+
       - name: Remember today's stories (avoids repeats tomorrow)
         if: success() && (inputs.mode == 'live' || github.event_name == 'schedule')
         run: |
+          # "Re-run all jobs" starts from an OLD copy of the repository, so GitHub's main
+          # branch may already be ahead. So: fetch the latest, merge the two seen.json
+          # files, then push. Try up to 3 times.
+          cp seen.json /tmp/seen_mine.json
           git config user.name "newspaper-bot"
           git config user.email "newspaper-bot@users.noreply.github.com"
-          git add seen.json
-          git diff --cached --quiet || (git commit -m "update seen stories" && git push)
+          for attempt in 1 2 3; do
+            git fetch origin main
+            git reset --hard origin/main
+            python3 merge_seen.py /tmp/seen_mine.json seen.json
+            git add seen.json
+            if git diff --cached --quiet; then echo "nothing new to save"; exit 0; fi
+            git commit -m "update seen stories"
+            if git push origin HEAD:main; then exit 0; fi
+            echo "push failed (attempt $attempt), trying again"
+            sleep 5
+          done
+          exit 1
+
       - name: Alert me if a step before the robot crashed
-        if: >
+        if: >-
           failure() && steps.robot.outcome != 'failure' &&
           (inputs.mode == 'live' || github.event_name == 'schedule')
         env:
